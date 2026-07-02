@@ -1,0 +1,8 @@
+{
+  "update_urls": [
+    "https://ddns.shecan.ir/update?password=YOUR_PASSWORD_HERE",
+    "https://ddns.shecan.ir/update?password=YOUR_SECOND_PASSWORD_HERE"
+  ],
+  "interval_minutes": 5,
+  "ip_check_url": "https://ip.shecan.ir/"
+}

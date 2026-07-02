@@ -1,0 +1,8 @@
+# ─── Sensitive config ───
+config.json
+state.json
+
+# ─── Python ───
+__pycache__/
+*.pyc
+*.pyo
