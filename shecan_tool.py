@@ -17,13 +17,11 @@ TEST_DOMAIN = "shecan.ir"
 TEST_TIMEOUT = 5
 
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+SAMPLE_CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config-sample.json")
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
 
 DEFAULT_CONFIG = {
-    "update_urls": [
-        "https://ddns.shecan.ir/update?password=0b0b6497ecdea05d",
-        "https://ddns.shecan.ir/update?password=f8557c3d386962c8"
-    ],
+    "update_urls": [],
     "interval_minutes": 5,
     "ip_check_url": "https://ip.shecan.ir/"
 }
@@ -33,8 +31,9 @@ def load_config():
     if os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE, "r") as f:
             return json.load(f)
-    with open(CONFIG_FILE, "w") as f:
-        json.dump(DEFAULT_CONFIG, f, indent=2)
+    if os.path.exists(SAMPLE_CONFIG_FILE):
+        with open(SAMPLE_CONFIG_FILE, "r") as f:
+            return json.load(f)
     return dict(DEFAULT_CONFIG)
 
 
@@ -233,6 +232,8 @@ def main():
     print(f"Fallback DNS   : {FALLBACK_DNS}")
     print(f"Update URLs    : {len(config['update_urls'])} configured")
     print(f"Config file    : {CONFIG_FILE}")
+    if not os.path.exists(CONFIG_FILE):
+        print("  [!] config.json not found — copy config-sample.json and set your DDNS passwords.")
 
     if "--once" in sys.argv:
         run_cycle(config, state)

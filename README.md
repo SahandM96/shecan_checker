@@ -1,406 +1,135 @@
 # Shecan DNS Guardian
 
-> **مهندس:** sahandm96
-> **پلتفرم:** Windows (PowerShell + Python 3)
-> **وضعیت:** عملیاتی
+**A lightweight Windows watchdog for [Shecan](https://shecan.ir) DNS — monitors health, auto-failover, and DDNS updates.**
+
+> Unofficial community tool. Not affiliated with or endorsed by Shecan.
+
+[English](#english) · [فارسی](#فارسی)
 
 ---
 
-## فهرست
+## English
 
-1. [مسئله](#مسئله)
-2. [راهکار کلی](#راهکار-کلی)
-3. [معماری پروژه](#معماری-پروژه)
-4. [شرح کامپوننت‌ها](#شرح-کامپوننت‌ها)
-   - [۱. ماژول DNS Reader](#۱-ماژول-dns-reader)
-   - [۲. ماژول Health Checker](#۲-ماژول-health-checker)
-   - [۳. ماژول DDNS Updater](#۳-ماژول-ddns-updater)
-   - [۴. ماژول Fallback Manager](#۴-ماژول-fallback-manager)
-   - [۵. ماژول IP Checker](#۵-ماژول-ip-checker)
-   - [۶. State Manager](#۶-state-manager)
-   - [۷. Config Loader](#۷-config-loader)
-5. [فلو Diagram](#فلو-diagram)
-6. [نحوه نصب و اجرا](#نحوه-نصب-و-اجرا)
-7. [خروجی نمونه](#خروجی-نمونه)
-8. [سناریوهای قطعی و عکس‌العمل سیستم](#سناریوهای-قطعی-و-عکسالعمل-سیستم)
-9. [مشکلات شناخته شده](#مشکلات-شناخته-شده)
-10. [رودمپ آینده](#رودمپ-آینده)
+### Why this exists
 
----
+[Shecan](https://shecan.ir) is a popular Iranian DNS service that helps users reach filtered websites. Two common pain points:
 
-## مسئله
+1. **Outages** — When Shecan DNS servers are unreachable, Windows may stall on every lookup and browsing breaks (`ERR_NAME_NOT_RESOLVED`).
+2. **Dynamic IP** — Users with changing public IPs must notify Shecan so traffic is routed correctly.
 
-### شکن چکار میکند؟
+This tool runs in the background, checks Shecan every few minutes, adds a temporary fallback DNS when needed, and pings your DDNS update URLs automatically.
 
-شکن (Shecan) یک سرویس DNS تحریم‌شکن ایرانی است. کاربر DNS سیستم خود را به سرورهای شکن指向 می‌کند تا:
+### Features
 
-- تحریم‌های اینترنتی دور زده شوند
-- دسترسی به سرویس‌های خارجی (GitHub, Google, Docker, npm, etc.) میسر شود
-- سرعت دسترسی به CDN‌های داخلی افزایش یابد
+- **DNS monitoring** — Reads current Windows DNS settings (PowerShell + `netsh` fallback)
+- **Health checks** — TCP probe on port 53 (no circular DNS dependency)
+- **Automatic failover** — Adds `8.8.8.8` when Shecan is down; removes it when Shecan recovers
+- **DDNS updates** — Calls your Shecan update URLs on each healthy cycle
+- **Public IP check** — Optional endpoint to verify connectivity
+- **Persistent state** — Remembers failover status across restarts (`state.json`)
+- **Zero dependencies** — Standard library only (Python 3.7+)
+- **Single-file core** — Easy to read, fork, and customize
 
-### DNS شکن
+### Requirements
 
-| نقش | آدرس |
-|------|-------|
-| Primary | `178.22.122.101` |
-| Secondary | `185.51.200.1` |
+| Requirement | Notes |
+|-------------|-------|
+| Windows 10/11 | Uses PowerShell 5.1+ and `netsh` |
+| Python 3.7+ | Must be on `PATH` |
+| Administrator | Required to change DNS via `Set-DnsClientServerAddress` |
+| Shecan DNS | Configure your adapter to Shecan before running (see below) |
 
-### مشکل اول: قطع شدن DNS شکن
-
-سرورهای DNS شکن گاهی دچار اختلال می‌شوند (وقفه سرویس، timeout، packet loss). در این حالت:
-
-1. ویندوز تلاش می‌کند به `178.22.122.101` متصل شود → **Timeout**
-2. سپس به `185.51.200.1` → **Timeout**
-3. در نهایت به `192.168.1.1` (مودم) → **Timeout**
-4. نتیجه: **کل اینترنت قطع می‌شود** — `ERR_NAME_NOT_RESOLVED`
-
-**ریشه:** شکن تنها Gateway DNS است. وقتی شکن down است، هیچ DNS fallback سریعی وجود ندارد.
-
-### مشکل دوم: تغییر IP داینامیک
-
-بسیاری از کاربران ایران IP داینامیک دارند. با هر بار تغییر IP (ریست مودم، قطع و وصل شدن)، شکن باید از IP جدید مطلع شود. در غیر این صورت:
-
-- ترافیک کاربر به سرور اشتباه هدایت می‌شود
-- اتصال شکن قطع می‌شود
-- کاربر باید دستی وارد پنل شود و "اعلام IP" را بزند
-
----
-
-## راهکار کلی
-
-### سه وظیفه اصلی
-
-```
-┌──────────────────────────────────────────────┐
-│             Shecan DNS Guardian                │
-├──────────────────────────────────────────────┤
-│  ۱. DNS Monitoring    │  تشخیص DNS سیستم و    │
-│                       │  صحت سنجی شکن         │
-├──────────────────────────────────────────────┤
-│  ۲. DDNS Updater      │  به‌روزرسانی خودکار   │
-│                       │  IP در سرور شکن       │
-├──────────────────────────────────────────────┤
-│  ۳. Fallback Manager  │  اضافه/حذف خودکار    │
-│                       │  DNS backup هنگام قطعی│
-└──────────────────────────────────────────────┘
-```
-
----
-
-## معماری پروژه
-
-```
-C:\workspace\shecan_checker\
-├── shecan_tool.py          # هسته اصلی (همه ماژول‌ها)
-├── config.json             # تنظیمات (update URLs, interval)
-├── state.json              # وضعیت runtime (آیا fallback فعال است)
-├── check_shecan.py         # نسخه اولیه (منسوخ)
-├── run_checker.bat         # اجراکننده با دوبل کلیک
-└── README.md               # این سند
-```
-
-### دیاگرام ارتباط ماژول‌ها
-
-```
-┌──────────────┐     ┌───────────────┐
-│  Config      │────▶│  ShecanTool   │
-│  (config.json│     │  (main loop)  │
-└──────────────┘     └───────┬───────┘
-                            │
-              ┌─────────────┼─────────────┐
-              │             │             │
-              ▼             ▼             ▼
-     ┌────────────┐ ┌────────────┐ ┌────────────┐
-     │ DNS Reader │ │ Health     │ │ DDNS       │
-     │ (PowerShell│ │ Checker    │ │ Updater    │
-     │  + netsh)  │ │ (port 53)  │ │ (HTTP GET) │
-     └────────────┘ └────────────┘ └────────────┘
-                          │
-                          ▼
-                   ┌──────────────┐
-                   │ Fallback     │
-                   │ Manager      │
-                   │ (set/remove  │
-                   │  DNS via PS) │
-                   └──────────────┘
-                          │
-                          ▼
-                   ┌──────────────┐
-                   │ State        │
-                   │ (state.json) │
-                   └──────────────┘
-```
-
----
-
-## شرح کامپوننت‌ها
-
-### ۱. ماژول DNS Reader
-
-```python
-def get_configured_dns() -> list[str]
-```
-
-**وظیفه:** خواندن DNS Serverهای فعال در شبکه
-
-**متد اجرا (۲ مرحله‌ای):**
-
-| مرحله | ابزار | توضیح |
-|-------|-------|--------|
-| ۱ (Fast Path) | `PowerShell: Get-DnsClientServerAddress` | لیست DNS سرورهای IPv4 از همه آداپترهای غیرمجازی |
-| ۲ (Fallback) | `netsh interface ip show dns` | اگر پاورشل timeout خورد (۵ ثانیه) |
-
-**خروجی نمونه:** `["192.168.1.1", "178.22.122.101", "185.51.200.1"]`
-
-**حالت‌های خطا:**
-- پاورشل timeout → auto fallback به netsh
-- netsh هم failed → لیست خالی برگردانده می‌شود
-- هیچ آداپتری active نیست → لیست خالی
-
----
-
-### ۲. ماژول Health Checker
-
-```python
-def is_shecan_alive() -> bool
-```
-
-**وظیفه:** بررسی زنده بودن DNS سرورهای شکن
-
-**متد:**
-- اتصال TCP به پورت 53 (DNS) سرورهای شکن
-- اول `178.22.122.101` (timeout: ۵ ثانیه)
-- اگر وصل نشد → `185.51.200.1`
-- اگر هیچکدام وصل نشدند → شکن DOWN در نظر گرفته می‌شود
-
-**چرا TCP port 53 و نه ping یا DNS lookup؟**
-- پینگ ممکن است توسط فایروال بلوک شود
-- DNS lookup خود وابسته به DNS است (circular dependency)
-- TCP port 53 مستقل از DNS resolution کار می‌کند
-
----
-
-### ۳. ماژول DDNS Updater
-
-```python
-def call_update_url(url: str) -> tuple[bool, str]
-```
-
-**وظیفه:** ارسال درخواست به لینک به‌روزرسانی شکن برای اعلام IP جدید
-
-**لینک‌های به‌روزرسانی (پیکربندی در config.json):**
-
-```
-https://ddns.shecan.ir/update?password=0b0b6497ecdea05d
-https://ddns.shecan.ir/update?password=f8557c3d386962c8
-```
-
-**نحوه کار:**
-- GET request با User-Agent استاندارد
-- پاسخ سرور: IP فعلی کاربر (مثل `5.217.181.13`)
-- اگر پاسخ ۲۰۰ باشد → موفق
-- اگر هر خطای دیگری → FAIL همراه با متن خطا
-
-**تعداد:** ۲ لینک (برای دو سرویس/محصول مختلف در حساب شکن)
-
-**مهم:** این مرحله فقط وقتی اجرا می‌شود که DNS کار کند (یا شکن alive باشد یا fallback 8.8.8.8 فعال باشد)
-
----
-
-### ۴. ماژول Fallback Manager
-
-این قلب هوشمند ابزار است.
-
-```python
-def set_dns_servers(interface_name: str, servers: list[str]) -> bool
-```
-
-**وظیفه:** مدیریت خودکار DNS سوم (Google 8.8.8.8) هنگام قطعی شکن
-
-**شرایط فعال‌سازی:**
-
-| وضعیت شکن | fallback فعال؟ | عکس‌العمل |
-|-----------|---------------|------------|
-| Alive     | خیر            | هیچ (stay idle) |
-| Alive     | بله            | fallback حذف ← بازگشت به DNS شکن تنها |
-| Dead      | خیر            | fallback اضافه ← `178.22.122.101, 185.51.200.1, 8.8.8.8` |
-| Dead      | بله            | هیچ (قبلاً اضافه شده) |
-
-**مکانیسم ذخیره وضعیت:**
-
-```json
-// state.json
-{
-  "fallback_added": true
-}
-```
-
-این فایل بین سیکل‌ها و حتی بین ری‌استارت‌های اسکریپت پایدار می‌ماند.
-
-**سناریوی کامل:**
-1. `t=0`: شکن alive، fallback=false
-2. `t=5min`: شکن still alive → هیچ
-3. `t=10min`: شکن DEAD → **8.8.8.8 به DNS اضافه می‌شود**، fallback=true
-4. `t=15min`: شکن still dead → fallback=true → هیچ (اینترنت به لطف 8.8.8.8 کار می‌کند)
-5. `t=20min`: شکن ALIVE → **8.8.8.8 حذف می‌شود**، fallback=false، بازگشت به تنظیمات خالص شکن
-
-**محدودیت:** تغییر DNS نیاز به **Admin Privileges** دارد.
-
----
-
-### ۵. ماژول IP Checker
-
-```python
-def check_ip_service(url: str) -> tuple[bool, str]
-```
-
-**وظیفه:** نمایش IP فعلی عمومی از دید شکن
-
-**آدرس:** `https://ip.shecan.ir/`
-
-**خروجی نمونه:** `5.217.181.13`
-
-**موارد استفاده:**
-- تأیید اینکه ترافیک از طریق شکن مسیریابی می‌شود
-- مقایسه IP بین سیکل‌ها برای تشخیص تغییر
-
----
-
-### ۶. State Manager
-
-```python
-def load_state() -> dict
-def save_state(state: dict) -> None
-```
-
-**وظیفه:** ذخیره و بازیابی وضعیت runtime
-
-**فایل:** `state.json` (در کنار اسکریپت)
-
-**داده‌های ذخیره شده:**
-- `fallback_added: bool` — آیا fallback DNS فعال است؟
-
-**چرا state.json؟**
-- اگر اسکریپت کرش کند یا کاربر ببنددش، در اجرای بعدی می‌داند fallback فعال است یا نه
-- از تغییرات بی‌مورد DNS جلوگیری می‌کند
-
----
-
-### ۷. Config Loader
-
-```python
-def load_config() -> dict
-```
-
-**وظیفه:** بارگذاری تنظیمات از `config.json`
-
-**اگر فایل وجود نداشته باشد:** با مقادیر پیش‌فرض ایجاد می‌کند
-
-**این تنظیمات:**
-
-| کلید | نوع | پیش‌فرض | توضیح |
-|------|------|----------|--------|
-| `update_urls` | `list[str]` | دو لینک شکن | لینک‌های DDNS برای به‌روزرسانی IP |
-| `interval_minutes` | `int` | `5` | فاصله بین سیکل‌ها |
-| `ip_check_url` | `str` | `https://ip.shecan.ir/` | سرویس تشخیص IP عمومی |
-
----
-
-## فلو Diagram
-
-```
-[Start]
-    │
-    ▼
-[Load Config & State]
-    │
-    ▼
-┌──────────────────┐
-│   CYCLE LOOP      │
-│  (هر N دقیقه)     │
-└──────────────────┘
-    │
-    ▼
-[1. Read DNS from adapters] ─── PowerShell (۵s timeout)
-    │                              └── netsh fallback
-    ▼
-[2. Check Shecan DNS in list?] ─── YES / NO
-    │
-    ▼
-[3. Check Shecan alive?] ───────── TCP port 53
-    │
-    ▼
-[4. Decision Matrix]
-    │
-    ├── Shecan YES + Alive YES + Fallback NO  → idle
-    ├── Shecan YES + Alive NO  + Fallback NO  → ADD 8.8.8.8
-    ├── Shecan YES + Alive YES + Fallback YES → REMOVE 8.8.8.8
-    ├── Shecan YES + Alive NO  + Fallback YES → idle (already rescued)
-    └── Shecan NO                             → alert user
-    │
-    ▼
-[5. Re-read DNS] ─── تأیید اعمال تغییرات
-    │
-    ▼
-[6. Call Update URLs] ─── فقط اگر DNS کار کند
-    │
-    ▼
-[7. Check Public IP] ─── ip.shecan.ir
-    │
-    ▼
-[Sleep N minutes] ─── goto cycle
-```
-
----
-
-## نحوه نصب و اجرا
-
-### پیش‌نیازها
-
-- Python 3.7+ (نصب شده در PATH)
-- ویندوز ۱۰/۱۱ (با PowerShell 5.1)
-- دسترسی Administrator برای تغییر DNS
-
-### مراحل
+### Quick start
 
 ```batch
-:: ۱. کلون کنید (یا فایل‌ها را کپی کنید)
-git clone https://github.com/sahandm96/shecan-guardian
-cd shecan-guardian
+git clone https://github.com/SahandM96/shecan_checker.git
+cd shecan_checker
 
-:: ۲. کپی کانفیگ نمونه و ویرایش
 copy config-sample.json config.json
-:: حالا config.json را باز کنید و پسوردهای DDNS واقعی را وارد کنید
+:: Edit config.json — add your DDNS update URLs from my.shecan.ir
 
-:: ۳. اجرا (حتماً as Administrator)
+:: Run as Administrator
 python shecan_tool.py
 ```
 
-### گزینه‌های اجرا
+**One-shot check (no loop):**
 
-| کامند | توضیح |
-|-------|--------|
-| `python shecan_tool.py` | اجرای loop بی‌نهایت با بازه تنظیم شده |
-| `python shecan_tool.py --once` | یک سیکل اجرا کن و خروج |
-| `run_checker.bat` | دوبل کلیک (باز شدن CMD و اجرا) |
+```batch
+python shecan_tool.py --once
+```
 
-### تنظیم DNS دستی (اولیه)
+**Double-click launcher:**
 
-اگر DNS سیستم روی شکن تنظیم نیست، قبلش دستی تنظیم کنید:
+```batch
+run_checker.bat
+```
 
-1. Control Panel → Network and Sharing Center → Change adapter settings
-2. راست کلیک روی Wi-Fi/Ethernet → Properties
-3. Internet Protocol Version 4 (TCP/IPv4) → Properties
-4. گزینه "Use the following DNS server addresses"
-5. Preferred: `178.22.122.101`
-6. Alternate: `185.51.200.1`
-7. OK
+### Initial DNS setup
 
----
+If Shecan is not configured yet:
 
-## خروجی نمونه
+1. **Settings** → **Network & Internet** → **Change adapter options**
+2. Right-click your active adapter → **Properties**
+3. **Internet Protocol Version 4 (TCP/IPv4)** → **Properties**
+4. **Use the following DNS server addresses**
+5. Preferred: `178.22.122.101` · Alternate: `185.51.200.1`
 
-### حالت عادی (شکن فعال)
+### Configuration
+
+Copy `config-sample.json` to `config.json` (never commit `config.json`).
+
+```json
+{
+  "update_urls": [
+    "https://ddns.shecan.ir/update?password=YOUR_PASSWORD_HERE"
+  ],
+  "interval_minutes": 5,
+  "ip_check_url": "https://ip.shecan.ir/"
+}
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `update_urls` | `string[]` | `[]` | DDNS update URLs from your Shecan panel |
+| `interval_minutes` | `int` | `5` | Minutes between monitoring cycles |
+| `ip_check_url` | `string` | `https://ip.shecan.ir/` | URL that returns your public IP |
+
+Get DDNS URLs from [my.shecan.ir](https://my.shecan.ir/panel/). You can list multiple URLs if you have more than one service.
+
+### How it works
+
+```
+┌─────────────┐     every N min     ┌──────────────────┐
+│ Read DNS    │ ─────────────────▶│ Shecan reachable?│
+└─────────────┘                   └────────┬─────────┘
+                                           │
+              ┌────────────────────────────┼────────────────────────────┐
+              ▼                            ▼                            ▼
+         Shecan OK                   Shecan DOWN                   No Shecan DNS
+         + no fallback               + no fallback                 → warn only
+         → idle                     → add 8.8.8.8 first
+         Shecan OK                   Shecan DOWN
+         + fallback active           + fallback active
+         → restore Shecan DNS        → keep fallback
+              │                            │
+              └────────────┬───────────────┘
+                           ▼
+                    DDNS + IP check (if DNS works)
+```
+
+**Failover order when Shecan is down:** `8.8.8.8` is placed **first** so Windows does not wait on dead Shecan servers.
+
+**Default Shecan servers used by the tool:**
+
+| Role | Address |
+|------|---------|
+| Primary | `178.22.122.101` |
+| Secondary | `185.51.200.1` |
+| Fallback | `8.8.8.8` |
+
+### Sample output
+
+**Normal operation:**
 
 ```
 ============================================================
@@ -409,226 +138,134 @@ python shecan_tool.py
   Shecan DNS     : YES
   Shecan alive   : YES
   DNS current    : 192.168.1.1, 178.22.122.101, 185.51.200.1
-  Update 1      : [OK] 5.217.181.13
-  Update 2      : [OK] 5.217.181.13
-  IP check       : [OK] 5.217.181.13
+  Update 1       : [OK] 203.0.113.42
+  IP check       : [OK] 203.0.113.42
 ```
 
-### قطعی شکن + فعال شدن fallback
+**Shecan down — fallback added:**
 
 ```
-============================================================
-[2026-07-02 16:15:00] Cycle 13
-  DNS configured : 192.168.1.1, 178.22.122.101, 185.51.200.1
-  Shecan DNS     : YES
   Shecan alive   : NO
   DNS fallback   : ADDED 8.8.8.8
-  DNS current    : 192.168.1.1, 178.22.122.101, 185.51.200.1, 8.8.8.8
-  Update 1      : [OK] 5.217.181.13
-  Update 2      : [OK] 5.217.181.13
-  IP check       : [OK] 5.217.181.13
+  DNS current    : 8.8.8.8, 178.22.122.101, 185.51.200.1
 ```
 
-### بازگشت شکن + حذف fallback
+**Shecan recovered — fallback removed:**
 
 ```
-============================================================
-[2026-07-02 16:20:00] Cycle 14
-  DNS configured : 192.168.1.1, 178.22.122.101, 185.51.200.1
-  Shecan DNS     : YES
   Shecan alive   : YES
   DNS fallback   : REMOVED
-  DNS current    : 192.168.1.1, 178.22.122.101, 185.51.200.1
-  Update 1      : [OK] 5.217.181.13
-  Update 2      : [OK] 5.217.181.13
-  IP check       : [OK] 5.217.181.13
 ```
 
-### قطعی کامل DNS (حتی 8.8.8.8 هم کار نمی‌کند)
+### Project structure
 
 ```
-============================================================
-[2026-07-02 16:25:00] Cycle 15
-  DNS configured : 192.168.1.1, 178.22.122.101, 185.51.200.1
-  Shecan DNS     : YES
-  Shecan alive   : NO
-  DNS fallback   : ACTIVE (8.8.8.8 added)
-  DNS current    : 192.168.1.1, 178.22.122.101, 185.51.200.1, 8.8.8.8
-  Update 1      : [FAIL] <urlopen error [Errno 11001] getaddrinfo failed>
-  Update 2      : [FAIL] <urlopen error [Errno 11001] getaddrinfo failed>
-  IP check       : [FAIL] <urlopen error [Errno 11001] getaddrinfo failed>
+shecan_checker/
+├── shecan_tool.py       # Main application
+├── config-sample.json   # Configuration template
+├── config.json          # Your config (gitignored)
+├── state.json           # Runtime state (gitignored)
+├── run_checker.bat      # Windows launcher
+├── check_shecan.py      # Legacy script (deprecated)
+└── README.md
 ```
+
+### Known limitations
+
+- **Windows only** — Uses PowerShell and `netsh`; no Linux/macOS support yet
+- **Admin required** — Without elevation, failover cannot change DNS
+- **Single instance** — Do not run two copies; they share `state.json`
+- **Virtual adapters** — VMware/Hyper-V adapters may slow DNS reads (5s timeout + `netsh` fallback)
+- **DNS cache delay** — After a full outage, Windows may need 1–2 minutes before lookups recover
+- **Fallback scope** — `8.8.8.8` restores basic DNS; some filtered sites may not work until Shecan returns
+
+### Roadmap
+
+- [ ] System tray / background mode
+- [ ] Desktop notifications on outage/recovery
+- [ ] Auto-start via Task Scheduler
+- [ ] File logging
+- [ ] Configurable fallback DNS in `config.json`
+- [ ] Linux support
+
+### Contributing
+
+Contributions are welcome.
+
+1. Fork the repository
+2. Create a feature branch (`git checkout -b feat/my-change`)
+3. Commit with [Conventional Commits](https://www.conventionalcommits.org/) (`feat:`, `fix:`, `docs:`, …)
+4. Open a Pull Request
+
+Please do not commit `config.json`, real DDNS passwords, or personal IPs.
+
+### License
+
+MIT — see [LICENSE](LICENSE).
+
+### Disclaimer
+
+This is free software provided as-is, with no warranty. Always keep a manual DNS fallback plan. Use at your own risk.
 
 ---
 
-## سناریوهای قطعی و عکس‌العمل سیستم
+## فارسی
 
-### سناریو ۱: قطع مقطعی DNS شکن (معمول)
+### معرفی
 
-**مدت:** ۳۰ ثانیه تا ۵ دقیقه
+**نگهبان DNS شکن** یک ابزار سبک ویندوزی برای کاربران [شکن](https://shecan.ir) است که:
 
-**واکنش سیستم:**
-```
-t+0:  Shecan dead → ADD fallback
-t+5:  Shecan still dead → fallback active → اینترنت سالم
-t+10: Shecan alive → REMOVE fallback
-```
+- وضعیت DNS شکن را مانیتور می‌کند
+- در صورت قطعی، به‌صورت خودکار DNS پشتیبان (`8.8.8.8`) اضافه می‌کند
+- پس از برگشت سرویس، تنظیمات شکن را بازمی‌گرداند
+- لینک‌های DDNS را برای اعلام IP جدید به‌روز می‌کند
 
-**نتیجه:** کاربر متوجه قطعی نمی‌شود. DNS شکن پشت پرده fallback می‌خورد.
+> ابزار غیررسمی جامعه کاربری است و وابسته به تیم شکن نیست.
 
----
+### ویژگی‌ها
 
-### سناریو ۲: قطع طولانی شکن (ساعت‌ها)
+- مانیتورینگ دوره‌ای DNS و سلامت سرورهای شکن
+- Failover خودکار بدون وابستگی به DNS lookup
+- پشتیبانی از چند URL به‌روزرسانی DDNS
+- بدون وابستگی خارجی — فقط Python استاندارد
+- مناسب اجرای دائمی در پس‌زمینه
 
-**واکنش سیستم:**
-```
-t+0:   ADD fallback
-t+5:   fallback active
-t+60:  fallback active
-...
-t+300: fallback active (تا وقتی شکن برگردد)
-```
+### نصب سریع
 
-**نتیجه:** تا برگشتن شکن، از Google DNS استفاده می‌کند. دسترسی به سایت‌های خارجی ممکن است محدود شود (تحریم), اما اینترنت قطع نمی‌شود.
-
----
-
-### سناریو ۳: تغییر IP (ریست مودم)
-
-**واکنش سیستم:**
-```
-Update 1: [OK] 5.217.181.13    (IP قبلی)
-Update 1: [OK] 5.217.181.14    (IP جدید — شکن از IP جدید مطلع شد)
+```batch
+git clone https://github.com/SahandM96/shecan_checker.git
+cd shecan_checker
+copy config-sample.json config.json
+:: پسوردهای DDNS را از پنل my.shecan.ir در config.json قرار دهید
+python shecan_tool.py
 ```
 
-**نتیجه:** IP جدید به سرور شکن اعلام شد. اتصال شکن پایدار می‌ماند.
+**اجرا حتماً با دسترسی Administrator.**
 
----
+### تنظیم DNS شکن
 
-### سناریو ۴: DNS دستی حذف شد (رفتن به تنظیمات و تغییر DNS)
+| نقش | آدرس |
+|-----|------|
+| اصلی | `178.22.122.101` |
+| جایگزین | `185.51.200.1` |
 
-**خروجی:**
-```
-  DNS configured : 192.168.1.1
-  Shecan DNS     : NO
-```
+### کانفیگ
 
-**واکنش:** ابزار هشدار می‌دهد اما DNS را بازگردانی نمی‌کند (فعلاً فقط مانیتورینگ).
+فایل `config-sample.json` را به `config.json` کپی کنید. پسورد DDNS را از [پنل شکن](https://my.shecan.ir/panel/) بگیرید.
 
----
+**هشدار امنیتی:** `config.json` را commit نکنید — در `.gitignore` قرار دارد.
 
-## مشکلات شناخته شده
+### محدودیت‌ها
 
-### ۱. Timeout در خواندن DNS با PowerShell
+- فقط ویندوز
+- نیاز به Admin برای تغییر DNS
+- فقط یک instance همزمان اجرا شود
+- در قطعی طولانی، `8.8.8.8` اینترنت را برمی‌گرداند اما ممکن است سایت‌های فیلترشده در دسترس نباشند
 
-**علت:** برخی آداپترهای مجازی (VirtualBox, Hyper-V, VMware) باعث کندی پاسخ PowerShell می‌شوند.
+### مشارکت
 
-**راهکار فعلی:** Timeout ۵ ثانیه + Fallback به `netsh`.
+Fork → branch → PR. از Conventional Commits استفاده کنید.
 
-**راهکار آینده:** فیلتر دقیق‌تر آداپترها با InterfaceMetric.
+### مجوز
 
----
-
-### ۲. getaddrinfo failed پس از قطع DNS
-
-**علت:** وقتی همه DNS‌ها failed می‌شوند (حتی 8.8.8.8)، تا ۲-۳ دقیقه طول می‌کشد تا DNS cache ویندوز ریفرش شود.
-
-**راهکار فعلی:** ابزار صبر می‌کند و سیکل بعدی دوباره تلاش می‌کند.
-
----
-
-### ۳. Admin Rights Required
-
-**علت:** تغییر DNS با `Set-DnsClientServerAddress` نیاز به admin دارد.
-
-**راهکار فعلی:** پیام خطا چاپ می‌شود و fallback اضافه نمی‌شود.
-
----
-
-### ۴. هم‌زمانی دو instance
-
-**علت:** اگر دو پنجره از اسکریپت همزمان اجرا شوند، state.json دچار race condition می‌شود.
-
-**راهکار فعلی:** ندارد — توصیه می‌شود فقط یک instance اجرا شود.
-
----
-
-## رودمپ آینده
-
-### اولویت بالا
-
-- [ ] **System Tray Mode** — اجرا در پس‌زمینه با آیکون notification area
-- [ ] **Desktop Notification** — Push notification هنگام قطع/وصل شکن
-- [ ] **Auto-start with Windows** — اضافه به Startup folder یا Task Scheduler
-- [ ] **Log to File** — ذخیره تمام تاریخچه در `shecan.log`
-
-### اولویت متوسط
-
-- [ ] **Web Dashboard** — نمایش وضعیت لحظه‌ای و تاریخچه در یک صفحه HTML ساده
-- [ ] **Telegram/Email Alert** — ارسال نوتیفیکیشن قطعی به پیام‌رسان
-- [ ] **DNS Test Suite** — تست سرعت و latency DNS شکن vs. بقیه
-- [ ] **Multi-config Support** — پشتیبانی از چند اکانت شکن
-
-### اولویت پایین
-
-- [ ] **GUI Settings Panel** — تنظیمات بصری به جای config.json
-- [ ] **Linux Support** — پورت به systemd-resolved / resolvconf
-- [ ] **Docker Container** — اجرا در کانتینر برای سرور
-- [ ] **Auto DNS Setup** — تنظیم خودکار DNS شکن روی آداپتر (اگر فعال نیست)
-
----
-
-## فایل‌های کانفیگ
-
-### `config-sample.json` — نمونه برای کپی کردن
-
-```json
-{
-  "update_urls": [
-    "https://ddns.shecan.ir/update?password=YOUR_PASSWORD_HERE",
-    "https://ddns.shecan.ir/update?password=YOUR_SECOND_PASSWORD_HERE"
-  ],
-  "interval_minutes": 5,
-  "ip_check_url": "https://ip.shecan.ir/"
-}
-```
-
-**نحوه استفاده:**
-1. `config-sample.json` را کپی کنید به `config.json`
-2. `YOUR_PASSWORD_HERE` را با پسورد واقعی که از پنل شکن گرفتی عوض کن
-3. اگر یک لینک داری، لینک دوم را پاک کن (یا بگذار برای اکانت دوم)
-
-### `config.json` — فایل واقعی (محرمانه)
-
-> **⚠️ امنیت:** این فایل شامل پسوردهای DDNS شماست. هرگز آن را commit نکنید.
-> 
-> `.gitignore` از قبل تنظیم شده تا `config.json` و `state.json` را نادیده بگیرد.
-
-### `.gitignore`
-
-```gitignore
-# Sensitive config
-config.json
-state.json
-
-# Python
-__pycache__/
-*.pyc
-*.pyo
-```
-
----
-
-## License
-
-MIT — استفاده آزاد، ویرایش آزاد، share کنید.
-
----
-
-<div dir="rtl">
-
-**ساخته شده با ☕ توسط sahandm96**  
-> این ابزار برای استفاده شخصی توسعه داده شده و تضمینی برای uptime 100% ندارد.  
-> همیشه یک fallback DNS دستی هم داشته باشید.
-
-</div>
+MIT — استفاده، تغییر و توزیع آزاد.
