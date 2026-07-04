@@ -23,7 +23,8 @@ This tool runs in the background, checks Shecan every few minutes, adds a tempor
 
 - **DNS monitoring** — Reads current Windows DNS settings (PowerShell + `netsh` fallback)
 - **Health checks** — TCP probe on port 53 (no circular DNS dependency)
-- **Automatic failover** — Adds `8.8.8.8` when Shecan is down; removes it when Shecan recovers
+- **Automatic failover** — Adds fallback DNS when Shecan is down; restores your original DNS when Shecan recovers (only when Shecan DNS is configured)
+- **Monitor-only mode** — If Shecan DNS is not on the active adapter, runs DDNS/IP checks without touching DNS settings
 - **DDNS updates** — Calls your Shecan update URLs on each healthy cycle
 - **Public IP check** — Optional endpoint to verify connectivity
 - **Persistent state** — Remembers failover status across restarts (`state.json`)
@@ -36,8 +37,8 @@ This tool runs in the background, checks Shecan every few minutes, adds a tempor
 |-------------|-------|
 | Windows 10/11 | Uses PowerShell 5.1+ and `netsh` |
 | Python 3.7+ | Must be on `PATH` |
-| Administrator | Required to change DNS via `Set-DnsClientServerAddress` |
-| Shecan DNS | Configure your adapter to Shecan before running (see below) |
+| Administrator | Required only for DNS failover (not for monitor-only mode) |
+| Shecan DNS | Optional — failover activates automatically when Shecan DNS is detected |
 
 ### Quick start
 
@@ -84,7 +85,9 @@ Copy `config-sample.json` to `config.json` (never commit `config.json`).
     "https://ddns.shecan.ir/update?password=YOUR_PASSWORD_HERE"
   ],
   "interval_minutes": 5,
-  "ip_check_url": "https://ip.shecan.ir/"
+  "ip_check_url": "https://ip.shecan.ir/",
+  "dns_failover": "auto",
+  "fallback_dns": "8.8.8.8"
 }
 ```
 
@@ -93,29 +96,38 @@ Copy `config-sample.json` to `config.json` (never commit `config.json`).
 | `update_urls` | `string[]` | `[]` | DDNS update URLs from your Shecan panel |
 | `interval_minutes` | `int` | `5` | Minutes between monitoring cycles |
 | `ip_check_url` | `string` | `https://ip.shecan.ir/` | URL that returns your public IP |
+| `dns_failover` | `string` | `"auto"` | `"auto"` = failover only when Shecan DNS detected; `"enabled"` = always allow failover; `"disabled"` = never change DNS |
+| `fallback_dns` | `string` | `"8.8.8.8"` | DNS server prepended during Shecan outages |
 
 Get DDNS URLs from [my.shecan.ir](https://my.shecan.ir/panel/). You can list multiple URLs if you have more than one service.
 
 ### How it works
 
 ```
-┌─────────────┐     every N min     ┌──────────────────┐
-│ Read DNS    │ ─────────────────▶│ Shecan reachable?│
-└─────────────┘                   └────────┬─────────┘
-                                           │
-              ┌────────────────────────────┼────────────────────────────┐
-              ▼                            ▼                            ▼
-         Shecan OK                   Shecan DOWN                   No Shecan DNS
-         + no fallback               + no fallback                 → warn only
-         → idle                     → add 8.8.8.8 first
-         Shecan OK                   Shecan DOWN
-         + fallback active           + fallback active
-         → restore Shecan DNS        → keep fallback
-              │                            │
-              └────────────┬───────────────┘
-                           ▼
-                    DDNS + IP check (if DNS works)
+┌─────────────┐     every N min     ┌──────────────────────┐
+│ Read DNS on │ ─────────────────▶│ Shecan DNS on adapter?│
+│ active NIC  │                   └──────────┬───────────┘
+└─────────────┘                              │
+              ┌──────────────────────────────┼──────────────────────────┐
+              ▼                              ▼                          ▼
+         monitor_only                   failover + OK              failover + DOWN
+         (no Shecan DNS)               → idle                     → backup DNS,
+         → DDNS only, never            Shecan OK + fallback       prepend fallback,
+           touch DNS settings          → restore from backup      keep router DNS
+              │                              │                          │
+              └──────────────────────────────┴──────────────────────────┘
+                                           ▼
+                              DDNS + IP check (if any DNS responds)
 ```
+
+**Operating modes:**
+
+| Mode | When | DNS changes |
+|------|------|-------------|
+| `monitor_only` | Active adapter has no Shecan DNS | Never |
+| `failover` | Shecan DNS detected (`dns_failover: auto`) | Backup → add fallback → restore on recovery |
+
+Before any DNS change, the tool saves your current DNS list to `state.json` (`dns_backup`) and restores it exactly when Shecan recovers. Router DNS (e.g. `192.168.1.1`) is preserved during failover.
 
 **Failover order when Shecan is down:** `8.8.8.8` is placed **first** so Windows does not wait on dead Shecan servers.
 
@@ -129,7 +141,18 @@ Get DDNS URLs from [my.shecan.ir](https://my.shecan.ir/panel/). You can list mul
 
 ### Sample output
 
-**Normal operation:**
+**Monitor-only (no Shecan DNS on adapter):**
+
+```
+  Adapter        : Wi-Fi
+  DNS configured : 192.168.1.1, 192.168.230.7
+  Shecan DNS     : NO
+  Mode           : monitor_only
+  Shecan alive   : YES
+  Update 1       : [OK] 203.0.113.42
+```
+
+**Normal operation (failover mode):**
 
 ```
 ============================================================
@@ -177,7 +200,23 @@ shecan_checker/
 - **Single instance** — Do not run two copies; they share `state.json`
 - **Virtual adapters** — VMware/Hyper-V adapters may slow DNS reads (5s timeout + `netsh` fallback)
 - **DNS cache delay** — After a full outage, Windows may need 1–2 minutes before lookups recover
-- **Fallback scope** — `8.8.8.8` restores basic DNS; some filtered sites may not work until Shecan returns
+- **Fallback scope** — Fallback DNS restores basic DNS; some filtered sites may not work until Shecan returns
+
+### Troubleshooting
+
+**Internet stops working until I disable/enable the network adapter**
+
+This was caused by the script overwriting DNS when Shecan was not configured, or restoring hardcoded Shecan IPs without preserving router DNS. Fixed in v2:
+
+- If Shecan DNS is **not** on your adapter → **monitor_only** mode (no DNS changes)
+- Stale `fallback_added` in `state.json` is cleared automatically
+- Original DNS is backed up before failover and restored exactly on recovery
+
+If you still have issues, delete `state.json` and restart the script. Pull the latest version from GitHub.
+
+**Updates skipped but internet works**
+
+The tool now checks whether **any** configured DNS server responds on port 53, not just Shecan. A temporary Shecan TCP failure no longer blocks DDNS when router DNS is working.
 
 ### Roadmap
 
@@ -185,7 +224,7 @@ shecan_checker/
 - [ ] Desktop notifications on outage/recovery
 - [ ] Auto-start via Task Scheduler
 - [ ] File logging
-- [ ] Configurable fallback DNS in `config.json`
+- [x] Configurable fallback DNS in `config.json`
 - [ ] Linux support
 
 ### Contributing
@@ -254,6 +293,15 @@ python shecan_tool.py
 فایل `config-sample.json` را به `config.json` کپی کنید. پسورد DDNS را از [پنل شکن](https://my.shecan.ir/panel/) بگیرید.
 
 **هشدار امنیتی:** `config.json` را commit نکنید — در `.gitignore` قرار دارد.
+
+- در صورت نبود DNS شکن روی آداپتر فعال → حالت **monitor_only** (بدون تغییر DNS)
+- قبل از failover، DNS فعلی در `state.json` ذخیره و پس از برگشت شکن دقیقاً بازگردانده می‌شود
+
+### عیب‌یابی
+
+**اینترنت قطع می‌شود تا کارت شبکه را disable/enable کنم**
+
+در نسخه جدید، اگر DNS شکن روی سیستم نباشد اسکریپت DNS را تغییر نمی‌دهد. `state.json` قدیمی را پاک کنید و آخرین نسخه را اجرا کنید.
 
 ### محدودیت‌ها
 
