@@ -4,5 +4,7 @@
     "https://ddns.shecan.ir/update?password=YOUR_SECOND_PASSWORD_HERE"
   ],
   "interval_minutes": 5,
-  "ip_check_url": "https://ip.shecan.ir/"
+  "ip_check_url": "https://ip.shecan.ir/",
+  "dns_failover": "auto",
+  "fallback_dns": "8.8.8.8"
 }
