@@ -21,15 +21,53 @@ CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.j
 SAMPLE_CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config-sample.json")
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
 
+LEGACY_SANCTION_PROBE_URLS = [
+    "https://pub.dev",
+    "https://storage.googleapis.com",
+]
+DEFAULT_SANCTION_PROBE_URLS = [
+    "https://pub.dev/api/packages/cli_util",
+    "https://storage.googleapis.com/flutter_infra_release/releases/releases_windows.json",
+]
+
+DEFAULT_SANCTION_MIRRORS = {
+    "enabled": "auto",
+    "probe_urls": DEFAULT_SANCTION_PROBE_URLS,
+    "env_vars": {
+        "FLUTTER_STORAGE_BASE_URL": "https://flutter.devneeds.ir",
+        "PUB_HOSTED_URL": "https://dart.devneeds.ir",
+    },
+    "env_scope": "auto",
+}
+
 DEFAULT_CONFIG = {
     "update_urls": [],
     "interval_minutes": 5,
     "ip_check_url": "https://ip.shecan.ir/",
     "dns_failover": "auto",
     "fallback_dns": DEFAULT_FALLBACK_DNS,
+    "sanction_mirrors": DEFAULT_SANCTION_MIRRORS,
 }
 
+PROBE_TIMEOUT = 10
+
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
+def merge_sanction_mirrors(config):
+    mirrors = config.get("sanction_mirrors")
+    if not isinstance(mirrors, dict):
+        mirrors = {}
+    merged = dict(DEFAULT_SANCTION_MIRRORS)
+    merged.update(mirrors)
+    merged["env_vars"] = {
+        **DEFAULT_SANCTION_MIRRORS["env_vars"],
+        **mirrors.get("env_vars", {}),
+    }
+    if merged.get("probe_urls") == LEGACY_SANCTION_PROBE_URLS:
+        merged["probe_urls"] = DEFAULT_SANCTION_PROBE_URLS
+    config["sanction_mirrors"] = merged
+    return config
 
 
 def load_config():
@@ -42,7 +80,9 @@ def load_config():
     else:
         config = dict(DEFAULT_CONFIG)
     for key, value in DEFAULT_CONFIG.items():
-        config.setdefault(key, value)
+        if key != "sanction_mirrors":
+            config.setdefault(key, value)
+    merge_sanction_mirrors(config)
     return config
 
 
@@ -50,7 +90,7 @@ def load_state():
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE, "r") as f:
             return json.load(f)
-    return {"fallback_added": False}
+    return {"fallback_added": False, "mirrors_active": False, "env_applied": {"user": {}, "machine": {}}}
 
 
 def save_state(state):
@@ -308,6 +348,206 @@ def check_ip_service(url):
         return False, str(e)
 
 
+def ps_escape(value):
+    return value.replace("'", "''")
+
+
+def set_env_var(name, value, scope):
+    ps_cmd = (
+        f"[Environment]::SetEnvironmentVariable('{ps_escape(name)}', "
+        f"'{ps_escape(value)}', '{scope}')"
+    )
+    result = run_powershell(ps_cmd, timeout=10)
+    if result is None:
+        return False, "PowerShell timed out or failed to start"
+    if result.returncode != 0:
+        err = (result.stderr or result.stdout or "unknown error").strip()
+        return False, err[:200]
+    return True, ""
+
+
+def remove_env_var(name, scope):
+    ps_cmd = (
+        f"[Environment]::SetEnvironmentVariable('{ps_escape(name)}', $null, '{scope}')"
+    )
+    result = run_powershell(ps_cmd, timeout=10)
+    if result is None:
+        return False, "PowerShell timed out or failed to start"
+    if result.returncode != 0:
+        err = (result.stderr or result.stdout or "unknown error").strip()
+        return False, err[:200]
+    return True, ""
+
+
+def broadcast_env_change():
+    try:
+        HWND_BROADCAST = 0xFFFF
+        WM_SETTINGCHANGE = 0x001A
+        SMTO_ABORTIFHUNG = 0x0002
+        result = ctypes.c_ulong()
+        ctypes.windll.user32.SendMessageTimeoutW(
+            HWND_BROADCAST,
+            WM_SETTINGCHANGE,
+            0,
+            "Environment",
+            SMTO_ABORTIFHUNG,
+            5000,
+            ctypes.byref(result),
+        )
+    except Exception:
+        pass
+
+
+def probe_url(url):
+    headers = {"User-Agent": "ShecanChecker/1.0"}
+    for method in ("HEAD", "GET"):
+        try:
+            req = Request(url, method=method, headers=headers)
+            resp = urlopen(req, timeout=PROBE_TIMEOUT)
+            if 200 <= resp.status < 400:
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def probe_sanctioned_domains(urls):
+    if not urls:
+        return True
+    return all(probe_url(url) for url in urls)
+
+
+def is_sanction_mirrors_enabled(config):
+    mode = config.get("sanction_mirrors", {}).get("enabled", "auto")
+    if mode == "disabled":
+        return False
+    if mode in ("auto", "enabled"):
+        return True
+    return False
+
+
+def resolve_env_scopes(config):
+    scope_mode = config.get("sanction_mirrors", {}).get("env_scope", "auto")
+    if scope_mode == "user":
+        return ["User"]
+    if scope_mode == "machine":
+        return ["Machine"] if is_admin() else []
+    scopes = ["User"]
+    if scope_mode == "auto" and is_admin():
+        scopes.append("Machine")
+    return scopes
+
+
+def clear_stale_mirror_state(state, remove_applied=False):
+    changed = False
+    if remove_applied:
+        scopes = []
+        env_applied = state.get("env_applied", {})
+        if env_applied.get("user"):
+            scopes.append("User")
+        if env_applied.get("machine"):
+            scopes.append("Machine")
+        if scopes:
+            changed = remove_mirror_env_vars(state, scopes, persist=False)
+    state["mirrors_active"] = False
+    state["env_applied"] = {"user": {}, "machine": {}}
+    save_state(state)
+    if changed:
+        broadcast_env_change()
+
+
+def apply_mirror_env_vars(config, state, scopes):
+    env_vars = config["sanction_mirrors"]["env_vars"]
+    if not env_vars:
+        return False
+
+    env_applied = state.setdefault("env_applied", {"user": {}, "machine": {}})
+    changed = False
+    for scope in scopes:
+        scope_key = scope.lower()
+        env_applied.setdefault(scope_key, {})
+        applied_names = []
+        for name, value in env_vars.items():
+            if env_applied[scope_key].get(name) == value:
+                continue
+            ok, err = set_env_var(name, value, scope)
+            if ok:
+                env_applied[scope_key][name] = value
+                applied_names.append(name)
+            else:
+                print(f"  Env mirrors    : FAILED [{scope}] {name} ({err})")
+        if applied_names:
+            print(f"  Env mirrors    : SET [{scope}] {', '.join(applied_names)}")
+            changed = True
+
+    if changed:
+        state["mirrors_active"] = True
+        save_state(state)
+        broadcast_env_change()
+    return changed
+
+
+def remove_mirror_env_vars(state, scopes, persist=True):
+    env_applied = state.setdefault("env_applied", {"user": {}, "machine": {}})
+    changed = False
+    for scope in scopes:
+        scope_key = scope.lower()
+        tracked = env_applied.get(scope_key, {})
+        if not tracked:
+            continue
+        removed_names = []
+        for name in list(tracked.keys()):
+            ok, err = remove_env_var(name, scope)
+            if ok:
+                removed_names.append(name)
+                del tracked[name]
+            else:
+                print(f"  Env mirrors    : FAILED remove [{scope}] {name} ({err})")
+        if removed_names:
+            print(f"  Env mirrors    : REMOVED [{scope}] {', '.join(removed_names)}")
+            changed = True
+
+    if not any(env_applied.get(key) for key in ("user", "machine")):
+        state["mirrors_active"] = False
+        state["env_applied"] = {"user": {}, "machine": {}}
+
+    if changed and persist:
+        save_state(state)
+        broadcast_env_change()
+    return changed
+
+
+def run_sanction_mirrors(config, state, domains_ok):
+    mirrors_active = state.get("mirrors_active", False)
+    scopes = resolve_env_scopes(config)
+    env_vars = config["sanction_mirrors"].get("env_vars", {})
+
+    if not env_vars:
+        print("  Env mirrors    : SKIPPED (no env_vars configured)")
+        return
+
+    if not scopes:
+        if mirrors_active:
+            print("  Env mirrors    : SKIPPED (machine scope requires admin)")
+        elif not domains_ok:
+            print("  Env mirrors    : SKIPPED set (machine scope requires admin)")
+        else:
+            print("  Env mirrors    : DIRECT")
+        return
+
+    if domains_ok:
+        if mirrors_active:
+            remove_mirror_env_vars(state, scopes)
+        else:
+            print("  Env mirrors    : DIRECT")
+    elif mirrors_active:
+        changed = apply_mirror_env_vars(config, state, scopes)
+        if not changed:
+            print("  Env mirrors    : ACTIVE")
+    else:
+        apply_mirror_env_vars(config, state, scopes)
+
+
 def run_failover(config, state, iface, dns_list, using_shecan, shecan_alive, fallback_dns):
     fallback_added = state.get("fallback_added", False)
     can_mutate = iface and dns_list and is_admin()
@@ -382,6 +622,23 @@ def run_cycle(config, state, cycle_num=None):
     else:
         run_failover(config, state, iface, dns_list, using_shecan, shecan_alive, fallback_dns)
 
+    mirrors_enabled = is_sanction_mirrors_enabled(config)
+    if not mirrors_enabled:
+        mode = config.get("sanction_mirrors", {}).get("enabled", "auto")
+        if mode == "disabled" and (
+            state.get("mirrors_active")
+            or state.get("env_applied", {}).get("user")
+            or state.get("env_applied", {}).get("machine")
+        ):
+            clear_stale_mirror_state(state, remove_applied=True)
+            print("  Env mirrors    : CLEARED (sanction mirrors disabled)")
+        print("  Sanction mirror: SKIPPED (disabled)")
+    else:
+        probe_urls = config["sanction_mirrors"]["probe_urls"]
+        domains_ok = probe_sanctioned_domains(probe_urls)
+        print(f"  Sanctions      : {'LIFTED' if domains_ok else 'ACTIVE'}")
+        run_sanction_mirrors(config, state, domains_ok)
+
     _, dns_now = get_active_adapter_dns(log_retries=False)
     dns_now_str = ", ".join(dns_now) if dns_now else "(none)"
     print(f"  DNS current    : {dns_now_str}")
@@ -406,10 +663,11 @@ def main():
     print(f"Shecan DNS     : {SHECAN_PRIMARY} / {SHECAN_SECONDARY}")
     print(f"Fallback DNS   : {fallback_dns}")
     print(f"DNS failover   : {config.get('dns_failover', 'auto')}")
+    print(f"Sanction mirror: {config.get('sanction_mirrors', {}).get('enabled', 'auto')}")
     print(f"Update URLs    : {len(config['update_urls'])} configured")
     print(f"Config file    : {CONFIG_FILE}")
     if not is_admin():
-        print("  [!] Not running as Administrator — DNS failover will be skipped.")
+        print("  [!] Not running as Administrator — DNS failover and Machine env scope will be skipped.")
     if not os.path.exists(CONFIG_FILE):
         print("  [!] config.json not found — copy config-sample.json and set your DDNS passwords.")
 

@@ -27,7 +27,8 @@ This tool runs in the background, checks Shecan every few minutes, adds a tempor
 - **Monitor-only mode** — If Shecan DNS is not on the active adapter, runs DDNS/IP checks without touching DNS settings
 - **DDNS updates** — Calls your Shecan update URLs on each healthy cycle
 - **Public IP check** — Optional endpoint to verify connectivity
-- **Persistent state** — Remembers failover status across restarts (`state.json`)
+- **Sanction mirror env vars** — Probes real domains (e.g. `pub.dev`, `storage.googleapis.com`); sets Flutter/Dart mirror URLs when blocked, removes them when all probes succeed
+- **Persistent state** — Remembers failover and mirror env status across restarts (`state.json`)
 - **Zero dependencies** — Standard library only (Python 3.7+)
 - **Single-file core** — Easy to read, fork, and customize
 
@@ -37,7 +38,7 @@ This tool runs in the background, checks Shecan every few minutes, adds a tempor
 |-------------|-------|
 | Windows 10/11 | Uses PowerShell 5.1+ and `netsh` |
 | Python 3.7+ | Must be on `PATH` |
-| Administrator | Required only for DNS failover (not for monitor-only mode) |
+| Administrator | Required for DNS failover and Machine-level env vars (User env works without Admin) |
 | Shecan DNS | Optional — failover activates automatically when Shecan DNS is detected |
 
 ### Quick start
@@ -87,7 +88,19 @@ Copy `config-sample.json` to `config.json` (never commit `config.json`).
   "interval_minutes": 5,
   "ip_check_url": "https://ip.shecan.ir/",
   "dns_failover": "auto",
-  "fallback_dns": "8.8.8.8"
+  "fallback_dns": "8.8.8.8",
+  "sanction_mirrors": {
+    "enabled": "auto",
+    "probe_urls": [
+      "https://pub.dev/api/packages/cli_util",
+      "https://storage.googleapis.com/flutter_infra_release/releases/releases_windows.json"
+    ],
+    "env_vars": {
+      "FLUTTER_STORAGE_BASE_URL": "https://flutter.devneeds.ir",
+      "PUB_HOSTED_URL": "https://dart.devneeds.ir"
+    },
+    "env_scope": "auto"
+  }
 }
 ```
 
@@ -98,8 +111,36 @@ Copy `config-sample.json` to `config.json` (never commit `config.json`).
 | `ip_check_url` | `string` | `https://ip.shecan.ir/` | URL that returns your public IP |
 | `dns_failover` | `string` | `"auto"` | `"auto"` = failover only when Shecan DNS detected; `"enabled"` = always allow failover; `"disabled"` = never change DNS |
 | `fallback_dns` | `string` | `"8.8.8.8"` | DNS server prepended during Shecan outages |
+| `sanction_mirrors.enabled` | `string` | `"auto"` | `"auto"`/`"enabled"` = probe every cycle; `"disabled"` = never change env vars |
+| `sanction_mirrors.probe_urls` | `string[]` | pub.dev API + Flutter release metadata | Real URLs — **all** must respond before mirrors are removed |
+| `sanction_mirrors.env_vars` | `object` | Flutter/Dart mirrors | Env var name → mirror URL applied when probes fail |
+| `sanction_mirrors.env_scope` | `string` | `"auto"` | `"auto"` = User always + Machine if Admin; `"user"` / `"machine"` |
 
 Get DDNS URLs from [my.shecan.ir](https://my.shecan.ir/panel/). You can list multiple URLs if you have more than one service.
+
+### Sanction mirror env vars (Flutter / Dart)
+
+When developing with Flutter in Iran, Google-hosted domains (`pub.dev`, `storage.googleapis.com`) may be blocked even when Shecan DNS is not directly configured on the active adapter (for example, when a router/local DNS proxy is used). Instead of manually setting mirror URLs in every terminal session:
+
+```powershell
+$env:FLUTTER_STORAGE_BASE_URL = "https://flutter.devneeds.ir"
+$env:PUB_HOSTED_URL = "https://dart.devneeds.ir"
+```
+
+The tool probes real Flutter/Pub endpoints each cycle. If **any** probe fails → mirror env vars are set. If **all** probes succeed → mirrors are removed so Flutter uses defaults. This mirror logic is independent from DNS failover, so it still runs when the active DNS is a router or local proxy such as `192.168.x.x`.
+
+| Status | Console | Action |
+|--------|---------|--------|
+| All probes OK | `Sanctions : LIFTED` | Remove tracked mirror env vars |
+| Any probe fails | `Sanctions : ACTIVE` | Set mirror env vars from config |
+| Already set | `Env mirrors : ACTIVE` | No change |
+| Direct access, no mirrors | `Env mirrors : DIRECT` | No change |
+
+**Env scope:** User-level vars are always applied. Machine-level vars are applied when running as Administrator (`env_scope: auto`).
+
+**Important:** Only env vars that the tool itself set are removed on recovery — manually set values are never touched. Open terminals and IDEs (VS Code, Android Studio) must be **restarted** to pick up env changes; the current PowerShell session keeps old values.
+
+**State tracking:** Applied vars are recorded in `state.json` under `env_applied` so the tool knows what to clean up.
 
 ### How it works
 
@@ -180,6 +221,21 @@ Before any DNS change, the tool saves your current DNS list to `state.json` (`dn
   DNS fallback   : REMOVED
 ```
 
+**Sanctions active — mirror env vars set:**
+
+```
+  Sanctions      : ACTIVE
+  Env mirrors    : SET [User] FLUTTER_STORAGE_BASE_URL, PUB_HOSTED_URL
+  Env mirrors    : SET [Machine] FLUTTER_STORAGE_BASE_URL, PUB_HOSTED_URL
+```
+
+**Sanctions lifted — mirror env vars removed:**
+
+```
+  Sanctions      : LIFTED
+  Env mirrors    : REMOVED [User] FLUTTER_STORAGE_BASE_URL, PUB_HOSTED_URL
+```
+
 ### Project structure
 
 ```
@@ -201,6 +257,9 @@ shecan_checker/
 - **Virtual adapters** — VMware/Hyper-V adapters may slow DNS reads (5s timeout + `netsh` fallback)
 - **DNS cache delay** — After a full outage, Windows may need 1–2 minutes before lookups recover
 - **Fallback scope** — Fallback DNS restores basic DNS; some filtered sites may not work until Shecan returns
+- **Env var sessions** — Existing terminals/IDEs do not see env changes until restarted; new processes pick them up automatically
+- **Tracked env only** — The tool only removes env vars it previously set; manual overrides are preserved
+- **Probe vs Shecan alive** — Shecan TCP:53 may work while Google domains remain blocked, and a router/local DNS proxy may hide Shecan DNS from the adapter; HTTP probes are more accurate for dev mirrors
 
 ### Troubleshooting
 
@@ -225,6 +284,7 @@ The tool now checks whether **any** configured DNS server responds on port 53, n
 - [ ] Auto-start via Task Scheduler
 - [ ] File logging
 - [x] Configurable fallback DNS in `config.json`
+- [x] Sanction mirror env vars for Flutter/Dart (auto probe + set/remove)
 - [ ] Linux support
 
 ### Contributing
@@ -258,6 +318,7 @@ This is free software provided as-is, with no warranty. Always keep a manual DNS
 - در صورت قطعی، به‌صورت خودکار DNS پشتیبان (`8.8.8.8`) اضافه می‌کند
 - پس از برگشت سرویس، تنظیمات شکن را بازمی‌گرداند
 - لینک‌های DDNS را برای اعلام IP جدید به‌روز می‌کند
+- متغیرهای محیطی mirror (Flutter/Dart) را بر اساس دسترسی به دامنه‌های واقعی تنظیم یا حذف می‌کند
 
 > ابزار غیررسمی جامعه کاربری است و وابسته به تیم شکن نیست.
 
@@ -266,6 +327,7 @@ This is free software provided as-is, with no warranty. Always keep a manual DNS
 - مانیتورینگ دوره‌ای DNS و سلامت سرورهای شکن
 - Failover خودکار بدون وابستگی به DNS lookup
 - پشتیبانی از چند URL به‌روزرسانی DDNS
+- **Sanction mirror** — probe endpointهای واقعی Flutter/Pub و تنظیم/حذف خودکار `FLUTTER_STORAGE_BASE_URL` و `PUB_HOSTED_URL`
 - بدون وابستگی خارجی — فقط Python استاندارد
 - مناسب اجرای دائمی در پس‌زمینه
 
@@ -279,7 +341,7 @@ copy config-sample.json config.json
 python shecan_tool.py
 ```
 
-**اجرا حتماً با دسترسی Administrator.**
+**اجرا با Admin برای failover DNS و scope Machine متغیرهای محیطی توصیه می‌شود. scope User بدون Admin هم کار می‌کند.**
 
 ### تنظیم DNS شکن
 
@@ -297,6 +359,29 @@ python shecan_tool.py
 - در صورت نبود DNS شکن روی آداپتر فعال → حالت **monitor_only** (بدون تغییر DNS)
 - قبل از failover، DNS فعلی در `state.json` ذخیره و پس از برگشت شکن دقیقاً بازگردانده می‌شود
 
+### Sanction mirror (Flutter / Dart)
+
+به‌جای تنظیم دستی در هر ترمینال:
+
+```powershell
+$env:FLUTTER_STORAGE_BASE_URL = "https://flutter.devneeds.ir"
+$env:PUB_HOSTED_URL = "https://dart.devneeds.ir"
+```
+
+ابزار هر سیکل endpointهای واقعی Flutter/Pub را probe می‌کند. اگر **همه** URLها در دسترس باشند → mirror حذف می‌شود. اگر **حتی یکی** fail شود → mirror اعمال می‌شود. این منطق مستقل از DNS failover است؛ بنابراین وقتی DNS فعال یک روتر یا DNS محلی مثل `192.168.x.x` باشد هم اجرا می‌شود.
+
+| کلید | توضیح |
+|------|-------|
+| `sanction_mirrors.enabled` | `"auto"`/`"enabled"` = probe در هر سیکل؛ `"disabled"` = عدم تغییر env |
+| `sanction_mirrors.probe_urls` | URLهای واقعی Flutter/Pub برای تست |
+| `sanction_mirrors.env_vars` | نام متغیر → URL mirror |
+| `sanction_mirrors.env_scope` | `"auto"` = User + Machine (با Admin) |
+
+**نکات مهم:**
+- ترمینال و IDE (VS Code، Android Studio) باید **restart** شوند تا env جدید را ببینند
+- فقط متغیرهایی که خود tool set کرده حذف می‌شوند — مقادیر دستی دست نخورده می‌مانند
+- Shecan ممکن است زنده باشد ولی Google هنوز block باشد، یا DNS روتر/محلی باعث شود IPهای شکن روی adapter دیده نشوند — probe HTTP دقیق‌تر است
+
 ### عیب‌یابی
 
 **اینترنت قطع می‌شود تا کارت شبکه را disable/enable کنم**
@@ -306,7 +391,8 @@ python shecan_tool.py
 ### محدودیت‌ها
 
 - فقط ویندوز
-- نیاز به Admin برای تغییر DNS
+- نیاز به Admin برای تغییر DNS و scope Machine متغیرهای محیطی
+- ترمینال/IDE باز env قدیمی را نگه می‌دارد تا restart شود
 - فقط یک instance همزمان اجرا شود
 - در قطعی طولانی، `8.8.8.8` اینترنت را برمی‌گرداند اما ممکن است سایت‌های فیلترشده در دسترس نباشند
 
